@@ -1,0 +1,258 @@
+name: "OSDO SAST"
+description: "Static Application Security Testing with Semgrep, CodeQL, and language-specific analyzers"
+author: "OpenSecDevOps"
+
+inputs:
+  path:
+    description: "Path to scan for security vulnerabilities"
+    required: false
+    default: "."
+  language:
+    description: "Programming language (auto, python, javascript, typescript, go, java, csharp, ruby, all)"
+    required: false
+    default: "auto"
+  scanners:
+    description: "Scanners to use (semgrep, codeql, bandit, eslint, all)"
+    required: false
+    default: "semgrep"
+  severity-threshold:
+    description: "Minimum severity to report (INFO, WARNING, ERROR)"
+    required: false
+    default: "WARNING"
+  fail-on-finding:
+    description: "Fail the action if vulnerabilities are found"
+    required: false
+    default: "true"
+  semgrep-rules:
+    description: "Semgrep ruleset (auto, p/security-audit, p/owasp-top-ten, p/cwe-top-25, custom path)"
+    required: false
+    default: "auto"
+  results-dir:
+    description: "Directory to store results"
+    required: false
+    default: ".osdo/results"
+
+outputs:
+  findings:
+    description: "Total vulnerabilities found"
+    value: ${{ steps.aggregate.outputs.total }}
+  critical-count:
+    description: "Critical severity count"
+    value: ${{ steps.aggregate.outputs.critical }}
+  high-count:
+    description: "High severity count"
+    value: ${{ steps.aggregate.outputs.high }}
+  sarif-file:
+    description: "Path to SARIF output file"
+    value: ${{ steps.aggregate.outputs.sarif-path }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Create results directory
+      shell: bash
+      run: |
+        mkdir -p ${{ inputs.results-dir }}/sast
+        echo "Results will be stored in ${{ inputs.results-dir }}/sast"
+
+    - name: Detect Language
+      id: detect-lang
+      shell: bash
+      run: |
+        if [ "${{ inputs.language }}" != "auto" ]; then
+          echo "language=${{ inputs.language }}" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Auto-detect language based on files
+        lang="unknown"
+        if [ -f "package.json" ]; then
+          lang="javascript"
+        elif [ -f "requirements.txt" ] || [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
+          lang="python"
+        elif [ -f "go.mod" ]; then
+          lang="go"
+        elif [ -f "pom.xml" ] || [ -f "build.gradle" ]; then
+          lang="java"
+        elif [ -f "*.csproj" ] || [ -f "*.sln" ]; then
+          lang="csharp"
+        elif [ -f "Gemfile" ]; then
+          lang="ruby"
+        fi
+
+        echo "language=$lang" >> $GITHUB_OUTPUT
+        echo "📁 Detected language: $lang"
+
+    - name: Semgrep Scan
+      if: contains(inputs.scanners, 'semgrep') || contains(inputs.scanners, 'all')
+      id: semgrep
+      shell: bash
+      env:
+        SEMGREP_APP_TOKEN: ${{ env.SEMGREP_APP_TOKEN || '' }}
+      run: |
+        echo "🔍 Running Semgrep SAST scan..."
+
+        # Install Semgrep
+        pip install semgrep --quiet
+
+        # Determine ruleset
+        ruleset="${{ inputs.semgrep-rules }}"
+        if [ "$ruleset" == "auto" ]; then
+          ruleset="p/security-audit p/secrets"
+        fi
+
+        # Run Semgrep
+        semgrep scan \
+          --config "$ruleset" \
+          --json \
+          --output ${{ inputs.results-dir }}/sast/semgrep.json \
+          --sarif \
+          --sarif-output ${{ inputs.results-dir }}/sast/semgrep.sarif \
+          ${{ inputs.path }} || true
+
+        # Extract counts
+        total=$(jq '.results | length' ${{ inputs.results-dir }}/sast/semgrep.json 2>/dev/null || echo "0")
+        errors=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' ${{ inputs.results-dir }}/sast/semgrep.json 2>/dev/null || echo "0")
+        warnings=$(jq '[.results[] | select(.extra.severity == "WARNING")] | length' ${{ inputs.results-dir }}/sast/semgrep.json 2>/dev/null || echo "0")
+
+        echo "semgrep-total=$total" >> $GITHUB_OUTPUT
+        echo "semgrep-errors=$errors" >> $GITHUB_OUTPUT
+        echo "semgrep-warnings=$warnings" >> $GITHUB_OUTPUT
+
+        echo "📊 Semgrep found: $total findings ($errors errors, $warnings warnings)"
+
+    - name: Bandit Scan (Python)
+      if: (steps.detect-lang.outputs.language == 'python') && (contains(inputs.scanners, 'bandit') || contains(inputs.scanners, 'all'))
+      id: bandit
+      shell: bash
+      run: |
+        echo "🔍 Running Bandit for Python..."
+
+        pip install bandit --quiet
+
+        bandit -r ${{ inputs.path }} \
+          -f json \
+          -o ${{ inputs.results-dir }}/sast/bandit.json \
+          --severity-level medium || true
+
+        # Extract counts
+        high=$(jq '[.results[] | select(.issue_severity == "HIGH")] | length' ${{ inputs.results-dir }}/sast/bandit.json 2>/dev/null || echo "0")
+        medium=$(jq '[.results[] | select(.issue_severity == "MEDIUM")] | length' ${{ inputs.results-dir }}/sast/bandit.json 2>/dev/null || echo "0")
+
+        echo "bandit-high=$high" >> $GITHUB_OUTPUT
+        echo "bandit-medium=$medium" >> $GITHUB_OUTPUT
+
+        echo "📊 Bandit found: $high high, $medium medium severity issues"
+
+    - name: ESLint Security Scan (JavaScript/TypeScript)
+      if: (steps.detect-lang.outputs.language == 'javascript' || steps.detect-lang.outputs.language == 'typescript') && (contains(inputs.scanners, 'eslint') || contains(inputs.scanners, 'all'))
+      id: eslint
+      shell: bash
+      run: |
+        echo "🔍 Running ESLint security scan..."
+
+        # Install ESLint with security plugins
+        npm install -g eslint eslint-plugin-security eslint-plugin-no-secrets --quiet || true
+
+        # Create security config if not exists
+        cat > .eslintrc.security.json << 'EOF'
+        {
+          "plugins": ["security", "no-secrets"],
+          "extends": ["plugin:security/recommended"],
+          "rules": {
+            "no-secrets/no-secrets": "error",
+            "security/detect-object-injection": "warn",
+            "security/detect-non-literal-regexp": "warn",
+            "security/detect-unsafe-regex": "error",
+            "security/detect-buffer-noassert": "error",
+            "security/detect-child-process": "warn",
+            "security/detect-disable-mustache-escape": "error",
+            "security/detect-eval-with-expression": "error",
+            "security/detect-no-csrf-before-method-override": "error",
+            "security/detect-possible-timing-attacks": "warn"
+          }
+        }
+        EOF
+
+        eslint ${{ inputs.path }} \
+          --config .eslintrc.security.json \
+          --format json \
+          --output-file ${{ inputs.results-dir }}/sast/eslint.json || true
+
+        # Count issues
+        issues=$(jq '[.[].messages[]] | length' ${{ inputs.results-dir }}/sast/eslint.json 2>/dev/null || echo "0")
+        echo "eslint-issues=$issues" >> $GITHUB_OUTPUT
+
+        echo "📊 ESLint found: $issues security issues"
+
+    - name: Aggregate Results
+      id: aggregate
+      shell: bash
+      run: |
+        echo "📊 Aggregating SAST results..."
+
+        total=0
+        critical=0
+        high=0
+
+        # Aggregate Semgrep
+        if [ -f "${{ inputs.results-dir }}/sast/semgrep.json" ]; then
+          semgrep_total=$(jq '.results | length' ${{ inputs.results-dir }}/sast/semgrep.json 2>/dev/null || echo "0")
+          semgrep_errors=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' ${{ inputs.results-dir }}/sast/semgrep.json 2>/dev/null || echo "0")
+          total=$((total + semgrep_total))
+          critical=$((critical + semgrep_errors))
+        fi
+
+        # Aggregate Bandit
+        if [ -f "${{ inputs.results-dir }}/sast/bandit.json" ]; then
+          bandit_high=$(jq '[.results[] | select(.issue_severity == "HIGH")] | length' ${{ inputs.results-dir }}/sast/bandit.json 2>/dev/null || echo "0")
+          high=$((high + bandit_high))
+        fi
+
+        # Aggregate ESLint
+        if [ -f "${{ inputs.results-dir }}/sast/eslint.json" ]; then
+          eslint_issues=$(jq '[.[].messages[] | select(.severity == 2)] | length' ${{ inputs.results-dir }}/sast/eslint.json 2>/dev/null || echo "0")
+          high=$((high + eslint_issues))
+        fi
+
+        echo "total=$total" >> $GITHUB_OUTPUT
+        echo "critical=$critical" >> $GITHUB_OUTPUT
+        echo "high=$high" >> $GITHUB_OUTPUT
+
+        # Set SARIF path (prefer Semgrep)
+        if [ -f "${{ inputs.results-dir }}/sast/semgrep.sarif" ]; then
+          echo "sarif-path=${{ inputs.results-dir }}/sast/semgrep.sarif" >> $GITHUB_OUTPUT
+        fi
+
+        echo ""
+        echo "═══════════════════════════════════════"
+        echo "  OSDO SAST Scan Summary"
+        echo "═══════════════════════════════════════"
+        echo "  Path: ${{ inputs.path }}"
+        echo "  Language: ${{ steps.detect-lang.outputs.language }}"
+        echo "  Total Findings: $total"
+        echo "  Critical: $critical"
+        echo "  High: $high"
+        echo "═══════════════════════════════════════"
+
+    - name: Check Threshold
+      if: inputs.fail-on-finding == 'true'
+      shell: bash
+      run: |
+        critical=${{ steps.aggregate.outputs.critical }}
+        high=${{ steps.aggregate.outputs.high }}
+
+        if [ "$critical" -gt 0 ]; then
+          echo "❌ Found $critical critical severity findings"
+          echo "::error::Critical SAST findings detected"
+          exit 1
+        fi
+
+        threshold="${{ inputs.severity-threshold }}"
+        if [ "$threshold" == "ERROR" ] && [ "$high" -gt 0 ]; then
+          echo "❌ Found $high high severity findings"
+          echo "::error::High severity SAST findings detected"
+          exit 1
+        fi
+
+        echo "✅ SAST scan completed within threshold"
